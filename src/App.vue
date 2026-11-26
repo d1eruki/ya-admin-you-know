@@ -73,6 +73,8 @@ const publication = ref<Publication | null>(null);
 const publishingEnabled = ref(false);
 const mediaEnabled = ref(false);
 const needsBaseline = ref(false);
+const publishDialog = ref<HTMLDialogElement>();
+const publishReviewOpen = ref(false);
 const publishing = computed(
   () =>
     publication.value?.status === "queued" ||
@@ -133,6 +135,16 @@ const unsaved = computed(() =>
   fields.value.some(
     (field) => (saved.value[field.key] ?? field.value) !== current(field),
   ),
+);
+const canReviewPublication = computed(
+  () =>
+    publishingEnabled.value &&
+    !loading.value &&
+    !editorLocked.value &&
+    !unsaved.value &&
+    !needsBaseline.value &&
+    hasSavedDraft.value &&
+    changed.value.length > 0,
 );
 const fieldCount = new Intl.NumberFormat("ru-RU");
 
@@ -340,7 +352,12 @@ function clearPreviews() {
 
 watch(
   () =>
-    visibleImages.value.map((field) => values.value[field.key]).filter(Boolean),
+    (publishReviewOpen.value
+      ? changed.value.filter((field) => field.type === "image")
+      : visibleImages.value
+    )
+      .map((field) => values.value[field.key])
+      .filter(Boolean),
   async (ids) => {
     const generation = editorGeneration;
     const token = sessionToken.value;
@@ -423,7 +440,15 @@ function schedulePublicationCheck() {
   }, 3000);
 }
 
+function showPublishReview() {
+  if (!canReviewPublication.value || !publishDialog.value) return;
+  error.value = "";
+  publishDialog.value.showModal();
+  publishReviewOpen.value = true;
+}
+
 async function publishDraft() {
+  if (!publishDialog.value?.open || !canReviewPublication.value) return;
   error.value = "";
   notice.value = "";
   pending.value = true;
@@ -432,6 +457,7 @@ async function publishDraft() {
       method: "POST",
       body: JSON.stringify({ revision: revision.value }),
     });
+    publishDialog.value?.close();
     schedulePublicationCheck();
   } catch (cause) {
     error.value =
@@ -723,6 +749,72 @@ onMounted(async () => {
       </form>
     </dialog>
 
+    <dialog
+      ref="publishDialog"
+      class="publish-review"
+      aria-labelledby="publish-review-title"
+      @cancel="pending && $event.preventDefault()"
+      @close="publishReviewOpen = false"
+    >
+      <form @submit.prevent="publishDraft">
+        <h2 id="publish-review-title">Сравнение изменений</h2>
+        <div class="publish-review-list" v-if="publishReviewOpen">
+          <section v-for="field in changed" :key="field.key">
+            <p class="breadcrumb">{{ field.section }} / {{ field.group }}</p>
+            <h3>{{ field.label }}</h3>
+            <div class="publish-review-values">
+              <figure>
+                <figcaption>Было</figcaption>
+                <img
+                  v-if="field.type === 'image'"
+                  :src="field.value"
+                  :alt="field.label"
+                  loading="lazy"
+                />
+                <p v-else class="publish-review-text">
+                  {{ field.value || "Пусто" }}
+                </p>
+              </figure>
+              <figure>
+                <figcaption>Стало</figcaption>
+                <template v-if="field.type === 'image'">
+                  <img
+                    v-if="previewUrls[current(field)]"
+                    :src="previewUrls[current(field)]"
+                    :alt="field.label"
+                    loading="lazy"
+                  />
+                  <p v-else>Новое изображение</p>
+                </template>
+                <p v-else class="publish-review-text">
+                  {{ current(field) || "Пусто" }}
+                </p>
+              </figure>
+            </div>
+          </section>
+        </div>
+        <p v-if="error" class="editor-error" role="alert">{{ error }}</p>
+        <div class="action-buttons">
+          <button
+            type="button"
+            class="secondary"
+            :disabled="pending"
+            autofocus
+            @click="publishDialog?.close()"
+          >
+            Назад
+          </button>
+          <button
+            type="submit"
+            class="primary"
+            :disabled="!canReviewPublication"
+          >
+            {{ pending ? "Запускаем публикацию…" : "Опубликовать" }}
+          </button>
+        </div>
+      </form>
+    </dialog>
+
     <div class="workarea">
       <button
         v-if="navigationOpen"
@@ -955,10 +1047,10 @@ onMounted(async () => {
           v-if="publishingEnabled"
           type="button"
           class="primary"
-          :disabled="editorLocked || unsaved || needsBaseline || !hasSavedDraft"
-          @click="publishDraft"
+          :disabled="!canReviewPublication"
+          @click="showPublishReview"
         >
-          Опубликовать
+          Продолжить
         </button>
       </div>
     </footer>

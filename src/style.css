@@ -438,6 +438,57 @@ h1 {
   display: flex;
   gap: 8px;
 }
+.publish-review {
+  width: min(720px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: clamp(16px, 4vw, 24px);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--paper);
+  overflow-wrap: anywhere;
+}
+.publish-review::backdrop {
+  background: #17243a60;
+}
+.publish-review form,
+.publish-review-list {
+  display: grid;
+  gap: 16px;
+}
+.publish-review h3 {
+  margin: 4px 0 8px;
+  font-size: 15px;
+}
+.publish-review-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 8px;
+}
+.publish-review-values figure {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--ground);
+}
+.publish-review-values figcaption {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.publish-review-text {
+  white-space: pre-wrap;
+}
+.publish-review-values img {
+  display: block;
+  max-width: 100%;
+  max-height: 180px;
+}
+.publish-review .editor-error {
+  margin-bottom: 0;
+}
+.publish-review .action-buttons {
+  justify-content: flex-end;
+}
 .primary,
 .secondary {
   border: 1px solid var(--line);
