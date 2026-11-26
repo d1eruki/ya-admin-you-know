@@ -68,9 +68,14 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
   lighthouse:
+    name: Lighthouse (${{ matrix.profile }})
     needs: [build, deploy]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [mobile, tablet, desktop]
     steps:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -78,115 +83,177 @@ jobs:
       - name: Install Lighthouse
         run: npm install --prefix "$RUNNER_TEMP/admin-lighthouse" --no-package-lock --no-audit --no-fund lighthouse@13.5.0
       - name: Audit the published pages
+        timeout-minutes: 7
         env:
           SITE_URL: ${{ needs.deploy.outputs.url }}
           ROUTES: ${{ needs.build.outputs.pages }}
+          PROFILE: ${{ matrix.profile }}
         run: |
-          node --input-type=module <<'NODE'
-          import { appendFile, mkdir, writeFile } from "node:fs/promises";
+          export CHROME_PATH="$(command -v google-chrome)"
+          test -x "$CHROME_PATH"
+          "$CHROME_PATH" --version
+          cat > "$RUNNER_TEMP/lighthouse-audit.mjs" <<'NODE'
+          import { spawn } from "node:child_process";
+          import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+          import { setTimeout } from "node:timers/promises";
           import { join } from "node:path";
           import { pathToFileURL } from "node:url";
           import { createRequire } from "node:module";
 
           const require = createRequire(join(process.env.RUNNER_TEMP, "admin-lighthouse", "audit.cjs"));
           const load = (name) => import(pathToFileURL(require.resolve(name)).href);
-          const [{ default: lighthouse }, { launch }, { default: desktop }, { userAgents }] =
+          const [{ default: lighthouse }, { default: desktop }, { userAgents }] =
             await Promise.all([
               load("lighthouse"),
-              load("chrome-launcher"),
               load("lighthouse/core/config/lr-desktop-config.js"),
               load("lighthouse/core/config/constants.js"),
             ]);
-
-          const reportDir = join(process.env.RUNNER_TEMP, "lighthouse-reports");
-          await mkdir(reportDir);
-          const categories = ["performance", "accessibility", "best-practices", "seo"];
-          const metrics = ["largest-contentful-paint", "total-blocking-time", "cumulative-layout-shift"];
+          const [url, profile, base] = process.argv.slice(2);
+          const timeoutSettings = { maxWaitForFcp: 15000, maxWaitForLoad: 25000 };
           const profiles = {
-            mobile: { extends: "lighthouse:default" },
+            mobile: { extends: "lighthouse:default", settings: timeoutSettings },
             tablet: {
               extends: "lighthouse:default",
               settings: {
+                ...timeoutSettings,
                 formFactor: "mobile",
                 screenEmulation: { mobile: true, width: 768, height: 1024, deviceScaleFactor: 2, disabled: false },
                 emulatedUserAgent: userAgents.mobile.replace(" Mobile ", " "),
               },
             },
-            desktop,
+            desktop: { ...desktop, settings: { ...desktop.settings, ...timeoutSettings } },
           };
-          const root = new URL(process.env.SITE_URL);
+          const directory = await mkdtemp(join(process.env.RUNNER_TEMP, "audit-chrome-"));
+          const chrome = spawn(process.env.CHROME_PATH, [
+            "--headless", "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
+            "--no-first-run", "--no-default-browser-check",
+            "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+            "--user-data-dir=" + directory, "about:blank",
+          ], { detached: true, stdio: ["ignore", "ignore", "pipe"] });
+          let stderr = "";
+          chrome.stderr.on("data", (data) => { stderr = (stderr + data).slice(-4000); });
+          let launchError;
+          chrome.on("error", (error) => { launchError = error; });
+          function stopChrome() {
+            if (!chrome.pid) return;
+            try { process.kill(-chrome.pid, "SIGKILL"); }
+            catch (error) { if (error.code !== "ESRCH") throw error; }
+          }
+          process.once("SIGTERM", () => { stopChrome(); process.exit(124); });
+          process.once("SIGINT", () => { stopChrome(); process.exit(130); });
+          try {
+            let port;
+            for (let attempt = 0; attempt < 100; attempt++) {
+              if (launchError) throw launchError;
+              if (chrome.exitCode !== null || chrome.signalCode !== null)
+                throw new Error("Chrome stopped before startup: " + stderr);
+              try {
+                const [value] = (await readFile(join(directory, "DevToolsActivePort"), "utf8")).split("\n");
+                port = Number(value);
+                if (Number.isInteger(port) && port > 0 && port <= 65535) break;
+              } catch (error) {
+                if (error.code !== "ENOENT") throw error;
+              }
+              await setTimeout(100);
+            }
+            if (!port) throw new Error("Chrome took too long to start: " + stderr);
+            console.log("Chrome ready");
+            const result = await lighthouse(url, {
+              port,
+              output: ["html", "json"],
+              logLevel: "error",
+              onlyCategories: ["performance", "accessibility", "best-practices", "seo"],
+            }, profiles[profile]);
+            if (!result) throw new Error("Lighthouse did not return a report");
+            await writeFile(base + ".html", result.report[0]);
+            await writeFile(base + ".json", result.report[1]);
+            console.log("Reports written");
+          } finally {
+            stopChrome();
+          }
+          process.exit(0);
+          NODE
+          node --input-type=module <<'NODE'
+          import { spawnSync } from "node:child_process";
+          import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+          import { join } from "node:path";
+
+          const { RUNNER_TEMP, SITE_URL, ROUTES, PROFILE, GITHUB_STEP_SUMMARY } = process.env;
+          const reportDir = join(RUNNER_TEMP, "lighthouse-reports");
+          await mkdir(reportDir);
+          const categories = ["performance", "accessibility", "best-practices", "seo"];
+          const metrics = ["largest-contentful-paint", "total-blocking-time", "cumulative-layout-shift"];
+          const root = new URL(SITE_URL);
           if (root.protocol !== "https:" || !root.pathname.endsWith("/")) throw new Error("Invalid Pages URL");
-          const summary = [
-            "# Lighthouse 13.5.0",
-            "",
-            "Холодный кеш. Телефон использует стандартную мобильную модель Lighthouse, планшет — ту же модель сети и CPU с экраном 768×1024 и DPR 2, компьютер — desktop-профиль.",
-          ];
+          const summary = ["# Lighthouse 13.5.0 · " + PROFILE, "",
+            "Эмуляция Chrome, три последовательных замера с холодным кешем."];
           const failures = [];
-          const routes = JSON.parse(process.env.ROUTES);
           const median = (values) => {
-            const ordered = [...values].sort((a, b) => a - b);
-            return ordered.length ? ordered[Math.floor(ordered.length / 2)] : NaN;
+            const sorted = [...values].sort((a, b) => a - b);
+            if (!sorted.length) return NaN;
+            const middle = Math.floor(sorted.length / 2);
+            return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
           };
           const show = (value, digits = 0) => Number.isFinite(value) ? value.toFixed(digits) : "—";
-          for (const [index, route] of routes.entries()) {
+          for (const [index, route] of JSON.parse(ROUTES).entries()) {
             const url = new URL(route, root).href;
-            summary.push("", "## " + url, "", "| Профиль | Замеры | Скорость (диапазон) | Доступность | Практики | SEO | LCP, с | TBT, мс | CLS |",
-              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
-            const http = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(15000) });
-            await http.body?.cancel();
+            const http = await fetch(url, { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(10000) });
             if (!http.ok) throw new Error("Published page failed: " + http.status + " " + url);
-            const settings = [];
-            for (const [name, config] of Object.entries(profiles)) {
-              const reports = [];
-              for (let run = 1; run <= 3; run++) {
-                const base = join(reportDir, "page-" + (index + 1) + "-" + name + "-" + run);
-                let chrome;
-                try {
-                  chrome = await launch({ chromeFlags: ["--headless", "--no-sandbox", "--disable-extensions"] });
-                  const result = await lighthouse(url, { port: chrome.port, output: ["html", "json"], logLevel: "error", onlyCategories: categories }, config);
-                  if (!result) throw new Error("Lighthouse did not return a report");
-                  await writeFile(base + ".html", result.report[0]);
-                  await writeFile(base + ".json", result.report[1]);
-                  const report = result.lhr;
-                  if (report.runtimeError || report.requestedUrl !== url || (report.finalDisplayedUrl ?? report.finalUrl) !== url ||
-                      categories.some((key) => !Number.isFinite(report.categories[key]?.score)) ||
-                      metrics.some((key) => !Number.isFinite(report.audits[key]?.numericValue))) {
-                    throw new Error("Audit failed, redirected, or missed metrics");
-                  }
-                  reports.push(report);
-                } catch (error) {
-                  failures.push(name + " " + run + " " + url + " — " + error.message);
-                  await writeFile(base + ".error.txt", String(error.stack ?? error));
-                } finally {
-                  await chrome?.kill();
+            const reports = [];
+            for (let run = 1; run <= 3; run++) {
+              const base = join(reportDir, "page-" + (index + 1) + "-" + PROFILE + "-" + run);
+              console.log("Lighthouse " + PROFILE + " " + run + "/3: " + url);
+              try {
+                const result = spawnSync("timeout", [
+                  "--kill-after=5s", "45s", process.execPath, join(RUNNER_TEMP, "lighthouse-audit.mjs"), url, PROFILE, base,
+                ], { stdio: "inherit" });
+                if (result.error) throw result.error;
+                if (result.status === 124 || result.status === 137) throw new Error("Measurement exceeded 45 seconds");
+                if (result.status !== 0) throw new Error("Lighthouse exited with " + (result.status ?? result.signal));
+                const report = JSON.parse(await readFile(base + ".json", "utf8"));
+                if (report.runtimeError) throw new Error(report.runtimeError.message);
+                if (report.requestedUrl !== url || (report.finalDisplayedUrl ?? report.finalUrl) !== url) {
+                  throw new Error("Measurement was redirected");
                 }
+                if (categories.some((key) => !Number.isFinite(report.categories[key]?.score)) ||
+                    metrics.some((key) => !Number.isFinite(report.audits[key]?.numericValue))) {
+                  throw new Error("Report is missing metrics");
+                }
+                reports.push(report);
+              } catch (error) {
+                const failure = PROFILE + " " + run + " " + url + " — " + error.message;
+                console.error(failure);
+                failures.push(failure);
+                await writeFile(base + ".error.txt", String(error.stack ?? error));
               }
-              if (reports.length) {
-                const { screenEmulation: screen, throttling, throttlingMethod } = reports[0].configSettings;
-                settings.push("- " + name + " — " + screen.width + "×" + screen.height + ", DPR " + screen.deviceScaleFactor +
-                  ", " + throttlingMethod + ", CPU ×" + throttling.cpuSlowdownMultiplier +
-                  ", RTT " + throttling.rttMs + " мс, " + throttling.throughputKbps + " кбит/с.");
-              }
-              const scores = (key) => reports.map((report) => report.categories[key].score * 100);
-              const speed = scores("performance");
-              const metric = (key) => median(reports.map((report) => report.audits[key].numericValue));
-              summary.push("| " + [name, reports.length + "/3", show(median(speed)) + " (" + show(Math.min(...speed)) + "–" + show(Math.max(...speed)) + ")",
-                ...categories.slice(1).map((key) => show(median(scores(key)))),
-                show(metric(metrics[0]) / 1000, 2), show(metric(metrics[1])), show(metric(metrics[2]), 3)].join(" | ") + " |");
             }
-            summary.push("", ...settings);
+            summary.push("", "## " + url, "",
+              "| Замеры | Скорость (диапазон) | Доступность | Практики | SEO | LCP, с | TBT, мс | CLS |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- |");
+            const scores = (key) => reports.map((report) => report.categories[key].score * 100);
+            const speed = scores("performance");
+            const metric = (key) => median(reports.map((report) => report.audits[key].numericValue));
+            summary.push("| " + [reports.length + "/3", show(median(speed)) + " (" + show(Math.min(...speed)) + "–" + show(Math.max(...speed)) + ")",
+              ...categories.slice(1).map((key) => show(median(scores(key)))),
+              show(metric(metrics[0]) / 1000, 2), show(metric(metrics[1])), show(metric(metrics[2]), 3)].join(" | ") + " |");
+            if (reports.length) {
+              const { screenEmulation: screen, throttling, throttlingMethod } = reports[0].configSettings;
+              summary.push("", screen.width + "×" + screen.height + ", DPR " + screen.deviceScaleFactor +
+                ", " + throttlingMethod + ", CPU ×" + throttling.cpuSlowdownMultiplier +
+                ", RTT " + throttling.rttMs + " мс, " + throttling.throughputKbps + " кбит/с.");
+            }
           }
           if (failures.length) summary.push("", "## Ошибки", ...failures.map((failure) => "- " + failure));
           const output = summary.join("\n") + "\n";
           await writeFile(join(reportDir, "summary.md"), output);
-          await appendFile(process.env.GITHUB_STEP_SUMMARY, output);
-          if (failures.length) process.exitCode = 1;
+          await appendFile(GITHUB_STEP_SUMMARY, output);
+          process.exit(failures.length ? 1 : 0);
           NODE
       - name: Save the audit reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: lighthouse-${{ github.run_id }}-${{ github.run_attempt }}
+          name: lighthouse-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/lighthouse-reports
           if-no-files-found: error
           retention-days: 14
