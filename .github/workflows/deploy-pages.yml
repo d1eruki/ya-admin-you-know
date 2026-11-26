@@ -1,0 +1,192 @@
+name: Deploy admin to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: admin-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      pages: ${{ steps.routes.outputs.pages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.22.1
+          cache: npm
+      - run: npm ci
+      - name: Build the admin
+        env:
+          VITE_API_URL: ${{ vars.ADMIN_API_URL }}
+        run: |
+          node -e 'const url = new URL(process.env.VITE_API_URL); if (url.protocol !== "https:" || url.href !== url.origin + "/") throw new Error("Set ADMIN_API_URL to the HTTPS origin of the Worker")'
+          npm run build
+      - name: List public HTML pages
+        id: routes
+        run: |
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { readdir } from "node:fs/promises";
+          const pages = (await readdir("dist", { recursive: true }))
+            .filter((name) => name.endsWith(".html") && !/(^|\/)404\.html$/.test(name))
+            .map((name) => name.split("/").map(encodeURIComponent).join("/").replace(/(^|\/)index\.html$/, "$1"));
+          if (!pages.length) throw new Error("The build has no pages");
+          console.log("pages=" + JSON.stringify(pages.sort()));
+          NODE
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    outputs:
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - name: Deploy the GitHub Pages artifact
+        id: pages
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  lighthouse:
+    needs: [build, deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.22.1
+      - name: Install Lighthouse
+        run: npm install --prefix "$RUNNER_TEMP/admin-lighthouse" --no-package-lock --no-audit --no-fund lighthouse@13.5.0
+      - name: Audit the published pages
+        env:
+          SITE_URL: ${{ needs.deploy.outputs.url }}
+          ROUTES: ${{ needs.build.outputs.pages }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFile, mkdir, writeFile } from "node:fs/promises";
+          import { join } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { createRequire } from "node:module";
+
+          const require = createRequire(join(process.env.RUNNER_TEMP, "admin-lighthouse", "audit.cjs"));
+          const load = (name) => import(pathToFileURL(require.resolve(name)).href);
+          const [{ default: lighthouse }, { launch }, { default: desktop }, { userAgents }] =
+            await Promise.all([
+              load("lighthouse"),
+              load("chrome-launcher"),
+              load("lighthouse/core/config/lr-desktop-config.js"),
+              load("lighthouse/core/config/constants.js"),
+            ]);
+
+          const reportDir = join(process.env.RUNNER_TEMP, "lighthouse-reports");
+          await mkdir(reportDir);
+          const categories = ["performance", "accessibility", "best-practices", "seo"];
+          const metrics = ["largest-contentful-paint", "total-blocking-time", "cumulative-layout-shift"];
+          const profiles = {
+            mobile: { extends: "lighthouse:default" },
+            tablet: {
+              extends: "lighthouse:default",
+              settings: {
+                formFactor: "mobile",
+                screenEmulation: { mobile: true, width: 768, height: 1024, deviceScaleFactor: 2, disabled: false },
+                emulatedUserAgent: userAgents.mobile.replace(" Mobile ", " "),
+              },
+            },
+            desktop,
+          };
+          const root = new URL(process.env.SITE_URL);
+          if (root.protocol !== "https:" || !root.pathname.endsWith("/")) throw new Error("Invalid Pages URL");
+          const summary = [
+            "# Lighthouse 13.5.0",
+            "",
+            "Холодный кеш. Телефон использует стандартную мобильную модель Lighthouse, планшет — ту же модель сети и CPU с экраном 768×1024 и DPR 2, компьютер — desktop-профиль.",
+          ];
+          const failures = [];
+          const routes = JSON.parse(process.env.ROUTES);
+          const median = (values) => {
+            const ordered = [...values].sort((a, b) => a - b);
+            return ordered.length ? ordered[Math.floor(ordered.length / 2)] : NaN;
+          };
+          const show = (value, digits = 0) => Number.isFinite(value) ? value.toFixed(digits) : "—";
+          for (const [index, route] of routes.entries()) {
+            const url = new URL(route, root).href;
+            summary.push("", "## " + url, "", "| Профиль | Замеры | Скорость (диапазон) | Доступность | Практики | SEO | LCP, с | TBT, мс | CLS |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+            const http = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(15000) });
+            await http.body?.cancel();
+            if (!http.ok) throw new Error("Published page failed: " + http.status + " " + url);
+            const settings = [];
+            for (const [name, config] of Object.entries(profiles)) {
+              const reports = [];
+              for (let run = 1; run <= 3; run++) {
+                const base = join(reportDir, "page-" + (index + 1) + "-" + name + "-" + run);
+                let chrome;
+                try {
+                  chrome = await launch({ chromeFlags: ["--headless", "--no-sandbox", "--disable-extensions"] });
+                  const result = await lighthouse(url, { port: chrome.port, output: ["html", "json"], logLevel: "error", onlyCategories: categories }, config);
+                  if (!result) throw new Error("Lighthouse did not return a report");
+                  await writeFile(base + ".html", result.report[0]);
+                  await writeFile(base + ".json", result.report[1]);
+                  const report = result.lhr;
+                  if (report.runtimeError || report.requestedUrl !== url || (report.finalDisplayedUrl ?? report.finalUrl) !== url ||
+                      categories.some((key) => !Number.isFinite(report.categories[key]?.score)) ||
+                      metrics.some((key) => !Number.isFinite(report.audits[key]?.numericValue))) {
+                    throw new Error("Audit failed, redirected, or missed metrics");
+                  }
+                  reports.push(report);
+                } catch (error) {
+                  failures.push(name + " " + run + " " + url + " — " + error.message);
+                  await writeFile(base + ".error.txt", String(error.stack ?? error));
+                } finally {
+                  await chrome?.kill();
+                }
+              }
+              if (reports.length) {
+                const { screenEmulation: screen, throttling, throttlingMethod } = reports[0].configSettings;
+                settings.push("- " + name + " — " + screen.width + "×" + screen.height + ", DPR " + screen.deviceScaleFactor +
+                  ", " + throttlingMethod + ", CPU ×" + throttling.cpuSlowdownMultiplier +
+                  ", RTT " + throttling.rttMs + " мс, " + throttling.throughputKbps + " кбит/с.");
+              }
+              const scores = (key) => reports.map((report) => report.categories[key].score * 100);
+              const speed = scores("performance");
+              const metric = (key) => median(reports.map((report) => report.audits[key].numericValue));
+              summary.push("| " + [name, reports.length + "/3", show(median(speed)) + " (" + show(Math.min(...speed)) + "–" + show(Math.max(...speed)) + ")",
+                ...categories.slice(1).map((key) => show(median(scores(key)))),
+                show(metric(metrics[0]) / 1000, 2), show(metric(metrics[1])), show(metric(metrics[2]), 3)].join(" | ") + " |");
+            }
+            summary.push("", ...settings);
+          }
+          if (failures.length) summary.push("", "## Ошибки", ...failures.map((failure) => "- " + failure));
+          const output = summary.join("\n") + "\n";
+          await writeFile(join(reportDir, "summary.md"), output);
+          await appendFile(process.env.GITHUB_STEP_SUMMARY, output);
+          if (failures.length) process.exitCode = 1;
+          NODE
+      - name: Save the audit reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lighthouse-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lighthouse-reports
+          if-no-files-found: error
+          retention-days: 14

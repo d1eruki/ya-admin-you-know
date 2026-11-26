@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ya-admin-you-know",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-11-26",
+  "dev": { "ip": "127.0.0.1", "port": 8787 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ya-admin-you-know",
+      "database_id": "d192835f-3598-4924-a047-59dd49e9a4b4",
+      "migrations_dir": "worker/migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DRAFT_MEDIA",
+      "bucket_name": "ya-admin-you-know-draft-media",
+    },
+  ],
+  "triggers": { "crons": ["17 * * * *"] },
+  "vars": {
+    "MAIL_FROM": "ya-admin-you-know <onboarding@resend.dev>",
+    "ALLOWED_ORIGINS": "http://127.0.0.1:5173,http://127.0.0.1:5195,https://d1eruki.github.io",
+  },
+}
